@@ -1,0 +1,15 @@
+[project]
+name = "quarryvae"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "MikhailVystrchil",email = "Ratven@yandex.ru"}
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
