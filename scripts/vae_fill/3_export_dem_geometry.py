@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUT_DEM = (
     PROJECT_ROOT
     / "outputs"
-    / "full_dem_defects_20261107_184938_460641"
+    / "real_dem_fill_20261107_192540_788012"
     / "dem_restored_only.tif"
 )
 
@@ -44,7 +44,7 @@ EXTRA_NODATA_VALUE = None
 # Локальные координаты удобнее для просмотра геометрии.
 # Обратное преобразование:
 # global_xyz = exported_xyz + coordinate_origin.
-USE_LOCAL_COORDINATES = True
+USE_LOCAL_COORDINATES = False
 
 # None — выбрать начало автоматически по первой валидной точке.
 # Либо явно задать (X0, Y0, Z0), одинаковое для нескольких экспортов.

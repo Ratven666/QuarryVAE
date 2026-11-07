@@ -225,3 +225,4 @@ data/interim/
 data/processed/
 .DS_Store
 outputs/
+/data/derived/

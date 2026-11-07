@@ -30,7 +30,7 @@ def find_project_root() -> Path:
 
 PROJECT_ROOT = find_project_root()
 
-INPUT_LAZ = PROJECT_ROOT / "data/raw/sever_quarry.las"
+INPUT_LAZ = PROJECT_ROOT / "data/raw/sever_quarry_filtered.las"
 
 OUTPUT_DEM = PROJECT_ROOT / "data/derived/dem_sever_quarry.tif"
 
