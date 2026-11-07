@@ -25,7 +25,7 @@ SOURCE_DEM = PROJECT_ROOT / "data/raw/1m/grib_1m.tif"
 CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
-    / "cvae_inpaint_20261107_130144_707340"
+    / "cvae_inpaint_20261107_155343_972452"
     / "best_model.pt"
 )
 

@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import csv
 import json
-import tempfile
 import time
-from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -30,73 +28,28 @@ SOURCE_DEM = PROJECT_ROOT / "data/raw/1m/grib_1m.tif"
 CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
-    / "cvae_inpaint_20261107_130144_707340"
+    / "cvae_inpaint_20261107_155343_972452"
     / "best_model.pt"
 )
 
 OUTPUT_DIR = (
     PROJECT_ROOT
     / "outputs"
-    / f"full_dem_fast_ensemble_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    / f"full_dem_defects_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
 )
+
+PATCH_SIZE = 64
+STRIDE = 16
+INFERENCE_BATCH_SIZE = 16
 
 DEVICE = "auto"
 SEED = 42
-
-PATCH_SIZE = 64
-STRIDE = 8
-
-# Число входных изображений за один вызов модели.
-# При нехватке памяти уменьши до 16.
-MODEL_BATCH_SIZE = 32
-
-# Число пространственных окон в одной задаче подготовки.
-# Для 4 окон и 9 вариантов задача создаёт 36 изображений.
-WINDOWS_PER_TASK = 4
-
-PREPARATION_WORKERS = 4
-PREFETCH_TASKS = 8
-
-# Ограничиваем вложенный параллелизм CPU.
-TORCH_CPU_THREADS = 2
+STOCHASTIC = False
 
 MIN_KNOWN_FRACTION = 0.40
-
-BLEND_SIGMA_FRACTION = 0.25
-MIN_BLEND_WEIGHT = 1e-3
-CONTEXT_WEIGHT_POWER = 2.0
+MIN_BLEND_WEIGHT = 0.05
 
 PRINT_EVERY_WINDOWS = 500
-
-# -------------------- Ансамбль --------------------
-
-# Вариант 0 всегда без шума.
-ENSEMBLE_RUNS = 9
-
-NOISE_STD_M = 0.10
-NOISE_SMOOTH_KERNEL = 5
-NOISE_CLIP_SIGMAS = 3.0
-
-# 0 — шум по всем известным пикселям окна.
-# >0 — шум только в полосе известных пикселей около пропуска.
-NOISE_CONTEXT_BAND = 12
-
-# Только шум входа, без дополнительной случайности latent.
-STOCHASTIC_LATENT = False
-
-MAD_THRESHOLD = 3.5
-MIN_REJECTION_THRESHOLD_M = 0.15
-MIN_ACCEPTED_PREDICTIONS = 3
-
-AGGREGATION_CHUNK_PIXELS = 100_000
-
-# True — накопитель ансамбля размещается во временном файле.
-# False — в RAM; может быть быстрее, если памяти достаточно.
-USE_DISK_ACCUMULATOR = True
-
-# None — системный каталог временных файлов.
-# Можно указать каталог на быстром локальном диске.
-TEMP_DIRECTORY = None
 
 # -------------------- Дефекты --------------------
 
@@ -112,6 +65,7 @@ DEFECT_TYPES = (
 
 SIZE_GROUPS = ("small", "medium", "large")
 
+# Все размеры — в пикселях.
 SQUARE_SIZES = {
     "small": (6, 12),
     "medium": (14, 26),
@@ -139,12 +93,20 @@ STRIPE_DIMENSIONS = {
 EDGE_MARGIN = 4
 VALID_CONTEXT_MARGIN = 8
 DEFECT_SEPARATION = 4
+
 PLACEMENT_ATTEMPTS_PER_DEFECT = 500
 
 EXTRA_NODATA_VALUE = None
 
+# -------------------- Сохранение --------------------
+
+SAVE_MULTIBAND_GEOTIFF = True
+SAVE_DIAGNOSTIC_MASKS = True
+
+GEOTIFF_BLOCK_SIZE = 256
+
 OVERVIEW_MAX_SIDE = 1600
-DETAIL_EXAMPLES = 10
+DETAIL_EXAMPLES = 12
 
 # ==================================================================
 
@@ -165,8 +127,15 @@ def write_csv(path, records):
     if not records:
         return
 
-    with path.open("w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=list(records[0]))
+    with path.open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=list(records[0]),
+        )
         writer.writeheader()
         writer.writerows(records)
 
@@ -182,61 +151,50 @@ def validate_settings():
         raise ValueError("Ожидается PATCH_SIZE=64.")
 
     if not isinstance(STRIDE, int) or not 1 <= STRIDE <= PATCH_SIZE:
-        raise ValueError("Некорректный STRIDE.")
+        raise ValueError("STRIDE должен быть целым от 1 до PATCH_SIZE.")
 
-    positive_integers = {
-        "MODEL_BATCH_SIZE": MODEL_BATCH_SIZE,
-        "WINDOWS_PER_TASK": WINDOWS_PER_TASK,
-        "PREPARATION_WORKERS": PREPARATION_WORKERS,
-        "PREFETCH_TASKS": PREFETCH_TASKS,
-        "TORCH_CPU_THREADS": TORCH_CPU_THREADS,
-        "PRINT_EVERY_WINDOWS": PRINT_EVERY_WINDOWS,
-        "AGGREGATION_CHUNK_PIXELS": AGGREGATION_CHUNK_PIXELS,
-        "DEFECTS_PER_GROUP": DEFECTS_PER_GROUP,
-        "PLACEMENT_ATTEMPTS_PER_DEFECT": PLACEMENT_ATTEMPTS_PER_DEFECT,
-        "DETAIL_EXAMPLES": DETAIL_EXAMPLES,
-        "OVERVIEW_MAX_SIDE": OVERVIEW_MAX_SIDE,
-    }
-
-    for name, value in positive_integers.items():
-        if not isinstance(value, int) or value < 1:
-            raise ValueError(f"{name} должен быть целым числом >= 1.")
+    if INFERENCE_BATCH_SIZE < 1:
+        raise ValueError("INFERENCE_BATCH_SIZE должен быть >= 1.")
 
     if not 0 < MIN_KNOWN_FRACTION < 1:
         raise ValueError("Некорректный MIN_KNOWN_FRACTION.")
 
-    if BLEND_SIGMA_FRACTION <= 0 or not 0 < MIN_BLEND_WEIGHT <= 1:
-        raise ValueError("Некорректные параметры blending.")
+    if not 0 < MIN_BLEND_WEIGHT <= 1:
+        raise ValueError("Некорректный MIN_BLEND_WEIGHT.")
 
-    if CONTEXT_WEIGHT_POWER < 0:
-        raise ValueError("CONTEXT_WEIGHT_POWER должен быть >= 0.")
+    if PRINT_EVERY_WINDOWS < 1:
+        raise ValueError("PRINT_EVERY_WINDOWS должен быть >= 1.")
 
-    if ENSEMBLE_RUNS < 3:
-        raise ValueError("ENSEMBLE_RUNS должен быть >= 3.")
+    if DEFECTS_PER_GROUP < 1:
+        raise ValueError("DEFECTS_PER_GROUP должен быть >= 1.")
 
-    if NOISE_STD_M < 0 or NOISE_CLIP_SIGMAS <= 0:
-        raise ValueError("Некорректные параметры шума.")
+    if PLACEMENT_ATTEMPTS_PER_DEFECT < 1:
+        raise ValueError("PLACEMENT_ATTEMPTS_PER_DEFECT должен быть >= 1.")
 
-    if (
-        NOISE_SMOOTH_KERNEL < 1
-        or NOISE_SMOOTH_KERNEL % 2 == 0
-        or NOISE_SMOOTH_KERNEL > PATCH_SIZE
-    ):
-        raise ValueError("Нужен нечётный NOISE_SMOOTH_KERNEL <= 64.")
-
-    if not isinstance(NOISE_CONTEXT_BAND, int) or NOISE_CONTEXT_BAND < 0:
-        raise ValueError("NOISE_CONTEXT_BAND должен быть целым >= 0.")
-
-    if MAD_THRESHOLD <= 0 or MIN_REJECTION_THRESHOLD_M <= 0:
-        raise ValueError("Некорректные пороги MAD.")
-
-    if not 1 <= MIN_ACCEPTED_PREDICTIONS <= ENSEMBLE_RUNS:
-        raise ValueError("Некорректный MIN_ACCEPTED_PREDICTIONS.")
-
-    if min(EDGE_MARGIN, VALID_CONTEXT_MARGIN, DEFECT_SEPARATION) < 0:
+    if min(
+        EDGE_MARGIN,
+        VALID_CONTEXT_MARGIN,
+        DEFECT_SEPARATION,
+    ) < 0:
         raise ValueError("Отступы не могут быть отрицательными.")
 
-    allowed_types = {"square", "circle", "ellipse", "stripe", "capsule"}
+    if DETAIL_EXAMPLES < 1 or OVERVIEW_MAX_SIDE < 1:
+        raise ValueError("Некорректные параметры визуализации.")
+
+    if (
+        not isinstance(GEOTIFF_BLOCK_SIZE, int)
+        or GEOTIFF_BLOCK_SIZE < 16
+        or GEOTIFF_BLOCK_SIZE % 16 != 0
+    ):
+        raise ValueError("GEOTIFF_BLOCK_SIZE должен быть кратен 16.")
+
+    allowed_types = {
+        "square",
+        "circle",
+        "ellipse",
+        "stripe",
+        "capsule",
+    }
 
     if not DEFECT_TYPES or not set(DEFECT_TYPES).issubset(allowed_types):
         raise ValueError("Некорректные DEFECT_TYPES.")
@@ -245,27 +203,35 @@ def validate_settings():
         raise ValueError("SIZE_GROUPS не должен быть пустым.")
 
     for group in SIZE_GROUPS:
-        bounds = [
+        bounds_list = [
             SQUARE_SIZES[group],
             CIRCLE_DIAMETERS[group],
             *ELLIPSE_AXES[group],
             *STRIPE_DIMENSIONS[group],
         ]
-        for lower, upper in bounds:
-            if not 0 < lower <= upper:
-                raise ValueError(f"Некорректные размеры: {group}.")
+
+        for lower, upper in bounds_list:
+            if not (
+                np.isfinite([lower, upper]).all()
+                and 0 < lower <= upper
+            ):
+                raise ValueError(
+                    f"Некорректные размеры для группы {group}."
+                )
 
 
 def choose_device():
     if DEVICE == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
+
         if torch.backends.mps.is_available():
             return torch.device("mps")
+
         return torch.device("cpu")
 
-    if DEVICE not in {"cpu", "cuda", "mps"}:
-        raise ValueError("DEVICE: auto/cpu/cuda/mps.")
+    if DEVICE not in {"cpu", "mps", "cuda"}:
+        raise ValueError("DEVICE: auto/cpu/mps/cuda.")
 
     if DEVICE == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA недоступна.")
@@ -288,21 +254,33 @@ def load_model(device):
     if preprocessing.get("normalization") != (
         "local min-max from known pixels"
     ):
-        raise ValueError("Несовместимая нормализация.")
+        raise ValueError(
+            "Нужен checkpoint с локальной min-max нормализацией."
+        )
 
     if preprocessing.get("known_mask_convention") != "1=known, 0=missing":
-        raise ValueError("Несовместимая маска.")
+        raise ValueError("Несовместимое соглашение о маске.")
 
     if int(preprocessing["patch_size"]) != PATCH_SIZE:
         raise ValueError("Размер окна не совпадает с checkpoint.")
 
-    minimum_scale = float(preprocessing["min_height_scale"])
+    minimum_scale = float(
+        preprocessing["min_height_scale"]
+    )
 
     if not np.isfinite(minimum_scale) or minimum_scale <= 0:
-        raise ValueError("Некорректный min_height_scale.")
+        raise ValueError(
+            "Некорректный min_height_scale в checkpoint."
+        )
 
-    model = QuarryCVAE(**checkpoint["model_config"])
-    model.load_state_dict(checkpoint["model_state_dict"])
+    model = QuarryCVAE(
+        **checkpoint["model_config"]
+    )
+
+    model.load_state_dict(
+        checkpoint["model_state_dict"]
+    )
+
     model.to(device)
     model.eval()
 
@@ -317,16 +295,33 @@ def load_dem():
         if min(src.height, src.width) < PATCH_SIZE:
             raise ValueError("DEM меньше окна модели.")
 
-        band = src.read(1, masked=True, out_dtype="float64")
+        band = src.read(
+            1,
+            masked=True,
+            out_dtype="float64",
+        )
+
         raw = np.asarray(band.data)
 
-        valid = ~np.ma.getmaskarray(band) & np.isfinite(raw)
+        valid = (
+            ~np.ma.getmaskarray(band)
+            & np.isfinite(raw)
+        )
 
         if EXTRA_NODATA_VALUE is not None:
             valid &= raw != EXTRA_NODATA_VALUE
 
-        with np.errstate(over="ignore", invalid="ignore"):
-            dem = raw * src.scales[0] + src.offsets[0]
+        scale = float(src.scales[0])
+        offset = float(src.offsets[0])
+
+        if not np.isfinite([scale, offset]).all():
+            raise ValueError("Некорректные scale/offset исходной DEM.")
+
+        with np.errstate(
+            over="ignore",
+            invalid="ignore",
+        ):
+            dem = raw * scale + offset
 
         valid &= np.isfinite(dem)
         dem[~valid] = np.nan
@@ -336,8 +331,9 @@ def load_dem():
             "width": src.width,
             "transform": src.transform,
             "crs": src.crs,
-            "source_scale": float(src.scales[0]),
-            "source_offset": float(src.offsets[0]),
+            "source_scale": scale,
+            "source_offset": offset,
+            "resolution": list(src.res),
         }
 
     if not valid.any():
@@ -347,57 +343,96 @@ def load_dem():
 
 
 def sample_range(rng, bounds):
-    return float(rng.uniform(bounds[0], bounds[1]))
+    return float(
+        rng.uniform(bounds[0], bounds[1])
+    )
 
 
 def make_template(rng, kind, group):
+    """Создаёт локальную растровую маску дефекта."""
     angle = float(rng.uniform(0, np.pi))
 
     if kind == "square":
-        length = width = sample_range(rng, SQUARE_SIZES[group])
+        length = width = sample_range(
+            rng,
+            SQUARE_SIZES[group],
+        )
+
     elif kind == "circle":
-        length = width = sample_range(rng, CIRCLE_DIAMETERS[group])
+        length = width = sample_range(
+            rng,
+            CIRCLE_DIAMETERS[group],
+        )
         angle = 0.0
+
     elif kind == "ellipse":
         major, minor = ELLIPSE_AXES[group]
         length = sample_range(rng, major)
         width = sample_range(rng, minor)
+
     elif kind in {"stripe", "capsule"}:
         long_bounds, width_bounds = STRIPE_DIMENSIONS[group]
         length = sample_range(rng, long_bounds)
         width = sample_range(rng, width_bounds)
+
     else:
         raise ValueError(kind)
 
-    cosine, sine = np.cos(angle), np.sin(angle)
+    cosine = np.cos(angle)
+    sine = np.sin(angle)
 
-    rx = int(np.ceil(
-        abs(cosine) * length / 2 + abs(sine) * width / 2
-    )) + 1
-    ry = int(np.ceil(
-        abs(sine) * length / 2 + abs(cosine) * width / 2
-    )) + 1
+    half_x = (
+        abs(cosine) * length / 2
+        + abs(sine) * width / 2
+    )
 
-    yy, xx = np.mgrid[-ry:ry + 1, -rx:rx + 1]
+    half_y = (
+        abs(sine) * length / 2
+        + abs(cosine) * width / 2
+    )
+
+    radius_x = int(np.ceil(half_x)) + 1
+    radius_y = int(np.ceil(half_y)) + 1
+
+    yy, xx = np.mgrid[
+        -radius_y:radius_y + 1,
+        -radius_x:radius_x + 1,
+    ]
 
     u = xx * cosine + yy * sine
     v = -xx * sine + yy * cosine
 
     if kind in {"square", "stripe"}:
-        mask = (np.abs(u) <= length / 2) & (np.abs(v) <= width / 2)
+        mask = (
+            (np.abs(u) <= length / 2)
+            & (np.abs(v) <= width / 2)
+        )
+
     elif kind in {"circle", "ellipse"}:
         mask = (
             (u / (length / 2)) ** 2
             + (v / (width / 2)) ** 2
         ) <= 1
+
     else:
-        segment_half = max((length - width) / 2, 0)
-        du = np.maximum(np.abs(u) - segment_half, 0)
-        mask = du ** 2 + v ** 2 <= (width / 2) ** 2
+        segment_half = max(
+            (length - width) / 2,
+            0,
+        )
+
+        distance_u = np.maximum(
+            np.abs(u) - segment_half,
+            0,
+        )
+
+        mask = (
+            distance_u ** 2 + v ** 2
+        ) <= (width / 2) ** 2
 
     rows, cols = np.nonzero(mask)
+
     if not rows.size:
-        raise RuntimeError("Пустая форма дефекта.")
+        raise RuntimeError("Сформирована пустая маска дефекта.")
 
     mask = mask[
         rows.min():rows.max() + 1,
@@ -415,7 +450,12 @@ def make_template(rng, kind, group):
 
 def create_defects(valid):
     rng = np.random.default_rng(SEED)
-    labels = np.zeros(valid.shape, dtype=np.uint32)
+
+    labels = np.zeros(
+        valid.shape,
+        dtype=np.uint32,
+    )
+
     height, width = valid.shape
 
     plan = [
@@ -424,6 +464,7 @@ def create_defects(valid):
         for group in SIZE_GROUPS
         for _ in range(DEFECTS_PER_GROUP)
     ]
+
     rng.shuffle(plan)
 
     records = []
@@ -433,28 +474,47 @@ def create_defects(valid):
         placed = False
 
         for _ in range(PLACEMENT_ATTEMPTS_PER_DEFECT):
-            mask, info = make_template(rng, kind, group)
+            mask, info = make_template(
+                rng,
+                kind,
+                group,
+            )
+
             mh, mw = mask.shape
 
-            margin = max(EDGE_MARGIN, VALID_CONTEXT_MARGIN)
+            margin = max(
+                EDGE_MARGIN,
+                VALID_CONTEXT_MARGIN,
+            )
+
             max_row = height - margin - mh
             max_col = width - margin - mw
 
             if max_row < margin or max_col < margin:
                 continue
 
-            row = int(rng.integers(margin, max_row + 1))
-            col = int(rng.integers(margin, max_col + 1))
-            r1, c1 = row + mh, col + mw
+            row = int(
+                rng.integers(margin, max_row + 1)
+            )
 
-            if not valid[
+            col = int(
+                rng.integers(margin, max_col + 1)
+            )
+
+            r1 = row + mh
+            c1 = col + mw
+
+            context = valid[
                 row - VALID_CONTEXT_MARGIN:r1 + VALID_CONTEXT_MARGIN,
                 col - VALID_CONTEXT_MARGIN:c1 + VALID_CONTEXT_MARGIN,
-            ].all():
+            ]
+
+            if not context.all():
                 continue
 
             sr0 = max(0, row - DEFECT_SEPARATION)
             sc0 = max(0, col - DEFECT_SEPARATION)
+
             sr1 = min(height, r1 + DEFECT_SEPARATION)
             sc1 = min(width, c1 + DEFECT_SEPARATION)
 
@@ -462,6 +522,7 @@ def create_defects(valid):
                 continue
 
             defect_id = len(records) + 1
+
             region = labels[row:r1, col:c1]
             region[mask] = defect_id
 
@@ -482,21 +543,263 @@ def create_defects(valid):
             failed[f"{kind}/{group}"] += 1
 
     if not records:
-        raise RuntimeError("Не удалось разместить дефекты.")
+        raise RuntimeError(
+            "Не удалось разместить дефекты. "
+            "Уменьши размеры или требования к контексту."
+        )
 
-    print(f"Создано дефектов: {len(records)} / {len(plan)}")
+    print(
+        f"Создано дефектов: "
+        f"{len(records)} / {len(plan)}"
+    )
+
+    counts = Counter(
+        f"{record['type']}/{record['size_group']}"
+        for record in records
+    )
+
+    for key, count in sorted(counts.items()):
+        print(f"  {key}: {count}")
+
     if failed:
-        print("Не размещены:", dict(failed))
+        print(
+            "Не удалось разместить:",
+            dict(failed),
+        )
 
     return labels, records, dict(failed)
 
 
-def write_geotiff(path, array, metadata, integer=False):
-    profile = {
+def window_starts(length):
+    if length < PATCH_SIZE:
+        raise ValueError(
+            "Размер оси меньше окна модели."
+        )
+
+    starts = list(
+        range(
+            0,
+            length - PATCH_SIZE + 1,
+            STRIDE,
+        )
+    )
+
+    last = length - PATCH_SIZE
+
+    if starts[-1] != last:
+        starts.append(last)
+
+    return starts
+
+
+@torch.inference_mode()
+def reconstruct(
+    model,
+    observed,
+    valid,
+    labels,
+    preprocessing,
+    device,
+):
+    model.eval()
+
+    started = time.perf_counter()
+
+    height, width = observed.shape
+
+    holes = labels > 0
+
+    # Только реальные известные высоты.
+    # Предсказания не становятся новым контекстом.
+    known = valid & ~holes
+
+    if not np.isfinite(observed[known]).all():
+        raise ValueError(
+            "В известных пикселях есть NaN/Inf."
+        )
+
+    prediction_sum = np.zeros(
+        observed.shape,
+        dtype=np.float64,
+    )
+
+    weight_sum = np.zeros(
+        observed.shape,
+        dtype=np.float64,
+    )
+
+    axis = np.hanning(PATCH_SIZE)
+
+    blend = np.maximum(
+        np.outer(axis, axis),
+        MIN_BLEND_WEIGHT,
+    )
+
+    batch_inputs = []
+    batch_info = []
+
+    processed = 0
+    skipped = 0
+
+    minimum_scale = float(
+        preprocessing["min_height_scale"]
+    )
+
+    def flush():
+        nonlocal processed
+
+        if not batch_inputs:
+            return
+
+        tensor = torch.from_numpy(
+            np.stack(batch_inputs)
+        ).to(device)
+
+        predictions = model(
+            tensor,
+            stochastic=STOCHASTIC,
+        ).cpu().numpy()[:, 0]
+
+        if not np.isfinite(predictions).all():
+            raise RuntimeError(
+                "Модель вернула NaN/Inf."
+            )
+
+        for prediction, info in zip(
+            predictions,
+            batch_info,
+        ):
+            row, col, offset, scale = info
+
+            region = np.s_[
+                row:row + PATCH_SIZE,
+                col:col + PATCH_SIZE,
+            ]
+
+            local_weights = (
+                blend * holes[region]
+            )
+
+            prediction_m = (
+                prediction.astype(np.float64)
+                * scale
+                + offset
+            )
+
+            prediction_sum[region] += (
+                prediction_m * local_weights
+            )
+
+            weight_sum[region] += local_weights
+
+        previous = processed
+        processed += len(batch_inputs)
+
+        if (
+            processed // PRINT_EVERY_WINDOWS
+            > previous // PRINT_EVERY_WINDOWS
+        ):
+            print(
+                f"Обработано окон: {processed:,}"
+            )
+
+        batch_inputs.clear()
+        batch_info.clear()
+
+    for row in window_starts(height):
+        for col in window_starts(width):
+            region = np.s_[
+                row:row + PATCH_SIZE,
+                col:col + PATCH_SIZE,
+            ]
+
+            if not holes[region].any():
+                continue
+
+            local_known = known[region]
+
+            if (
+                local_known.mean() < MIN_KNOWN_FRACTION
+                or not local_known.any()
+            ):
+                skipped += 1
+                continue
+
+            visible = observed[region][local_known]
+
+            offset = float(visible.min())
+
+            scale = max(
+                float(visible.max()) - offset,
+                minimum_scale,
+            )
+
+            normalized = np.zeros(
+                (PATCH_SIZE, PATCH_SIZE),
+                dtype=np.float32,
+            )
+
+            normalized[local_known] = (
+                (visible - offset) / scale
+            ).astype(np.float32)
+
+            if not np.isfinite(normalized).all():
+                raise RuntimeError(
+                    "Ошибка нормализации окна."
+                )
+
+            batch_inputs.append(
+                np.stack(
+                    [
+                        normalized,
+                        local_known.astype(np.float32),
+                    ],
+                    axis=0,
+                )
+            )
+
+            batch_info.append(
+                (row, col, offset, scale)
+            )
+
+            if len(batch_inputs) >= INFERENCE_BATCH_SIZE:
+                flush()
+
+    flush()
+
+    filled = holes & (weight_sum > 0)
+
+    completed = observed.copy()
+
+    completed[filled] = (
+        prediction_sum[filled]
+        / weight_sum[filled]
+    )
+
+    if not np.isfinite(completed[filled]).all():
+        raise RuntimeError(
+            "NaN/Inf после объединения предсказаний."
+        )
+
+    return completed, filled, {
+        "processed_windows": processed,
+        "skipped_windows": skipped,
+        "inference_seconds": float(
+            time.perf_counter() - started
+        ),
+    }
+
+
+def geotiff_profile(
+    metadata,
+    count=1,
+    integer=False,
+):
+    return {
         "driver": "GTiff",
         "height": metadata["height"],
         "width": metadata["width"],
-        "count": 1,
+        "count": count,
         "dtype": "uint32" if integer else "float64",
         "crs": metadata["crs"],
         "transform": metadata["transform"],
@@ -504,516 +807,248 @@ def write_geotiff(path, array, metadata, integer=False):
         "compress": "deflate",
         "predictor": 2 if integer else 3,
         "tiled": True,
-        "blockxsize": 256,
-        "blockysize": 256,
+        "blockxsize": GEOTIFF_BLOCK_SIZE,
+        "blockysize": GEOTIFF_BLOCK_SIZE,
         "BIGTIFF": "IF_SAFER",
     }
 
-    with rasterio.open(path, "w", **profile) as dst:
+
+def write_geotiff(
+    path,
+    array,
+    metadata,
+    integer=False,
+    name=None,
+    description=None,
+):
+    profile = geotiff_profile(
+        metadata,
+        count=1,
+        integer=integer,
+    )
+
+    with rasterio.open(
+        path,
+        "w",
+        **profile,
+    ) as dst:
         for _, window in dst.block_windows(1):
             rows, cols = window.toslices()
-            block = array[rows, cols]
-            if integer:
-                block = block.astype(np.uint32, copy=False)
-            dst.write(block, 1, window=window)
 
-
-def window_starts(length):
-    starts = list(range(0, length - PATCH_SIZE + 1, STRIDE))
-    last = length - PATCH_SIZE
-    if starts[-1] != last:
-        starts.append(last)
-    return starts
-
-
-def blend_weights():
-    coordinates = (
-        np.arange(PATCH_SIZE, dtype=np.float64)
-        - (PATCH_SIZE - 1) / 2
-    )
-    sigma = PATCH_SIZE * BLEND_SIGMA_FRACTION
-    axis = np.exp(-0.5 * (coordinates / sigma) ** 2)
-    weights = np.outer(axis, axis)
-    weights /= weights.max()
-    return np.maximum(weights, MIN_BLEND_WEIGHT)
-
-
-def box_sum(array, kernel, mode):
-    """Сумма по квадратному окну через интегральный массив."""
-    pad = kernel // 2
-    padded = np.pad(
-        array,
-        ((pad, pad), (pad, pad)),
-        mode=mode,
-    )
-
-    integral = np.pad(
-        padded,
-        ((1, 0), (1, 0)),
-        mode="constant",
-    ).cumsum(axis=0, dtype=np.float64).cumsum(axis=1)
-
-    return (
-        integral[kernel:, kernel:]
-        - integral[:-kernel, kernel:]
-        - integral[kernel:, :-kernel]
-        + integral[:-kernel, :-kernel]
-    )
-
-
-def make_noise(run_index, row, col, active):
-    noise = np.zeros((PATCH_SIZE, PATCH_SIZE), dtype=np.float32)
-
-    if run_index == 0 or NOISE_STD_M == 0 or active.sum() < 2:
-        return noise
-
-    rng = np.random.default_rng(
-        np.random.SeedSequence(
-            [SEED, 8127, run_index, row, col]
-        )
-    )
-
-    field = rng.standard_normal(
-        (PATCH_SIZE, PATCH_SIZE),
-        dtype=np.float32,
-    )
-
-    if NOISE_SMOOTH_KERNEL > 1:
-        field = box_sum(
-            field,
-            NOISE_SMOOTH_KERNEL,
-            mode="reflect",
-        ) / NOISE_SMOOTH_KERNEL ** 2
-
-    values = field[active].astype(np.float64)
-    values -= values.mean()
-    std = float(values.std())
-
-    if std > 1e-12:
-        values *= NOISE_STD_M / std
-        values = np.clip(
-            values,
-            -NOISE_CLIP_SIGMAS * NOISE_STD_M,
-            NOISE_CLIP_SIGMAS * NOISE_STD_M,
-        )
-        noise[active] = values.astype(np.float32)
-
-    return noise
-
-
-@torch.inference_mode()
-def run_ensemble(model, observed, known, holes, preprocessing, device):
-    """
-    Накопитель имеет форму [вариант ансамбля, пиксель пропуска].
-
-    Нормализация, маска и геометрические веса одинаковы
-    для всех вариантов одного окна.
-    """
-    height, width = observed.shape
-    hole_indices = np.flatnonzero(holes.ravel())
-    count = len(hole_indices)
-
-    if count >= np.iinfo(np.int32).max:
-        raise ValueError("Слишком много пикселей пропусков для int32.")
-
-    # Связь координат полной DEM с компактным накопителем.
-    index_map = np.full(observed.shape, -1, dtype=np.int32)
-    index_map.ravel()[hole_indices] = np.arange(count, dtype=np.int32)
-
-    denominator = np.zeros(count, dtype=np.float64)
-    blend = blend_weights()
-    minimum_scale = float(preprocessing["min_height_scale"])
-
-    row_presence = holes.any(axis=1)
-    col_presence = holes.any(axis=0)
-
-    rows = [
-        row for row in window_starts(height)
-        if row_presence[row:row + PATCH_SIZE].any()
-    ]
-    cols = [
-        col for col in window_starts(width)
-        if col_presence[col:col + PATCH_SIZE].any()
-    ]
-
-    def coordinate_tasks():
-        batch = []
-
-        for row in rows:
-            for col in cols:
-                region = np.s_[
-                    row:row + PATCH_SIZE,
-                    col:col + PATCH_SIZE,
-                ]
-                if not holes[region].any():
-                    continue
-
-                batch.append((row, col))
-                if len(batch) >= WINDOWS_PER_TASK:
-                    yield batch
-                    batch = []
-
-        if batch:
-            yield batch
-
-    def prepare_task(coordinates):
-        inputs = []
-        metadata = []
-        skipped = 0
-
-        for row, col in coordinates:
-            region = np.s_[
-                row:row + PATCH_SIZE,
-                col:col + PATCH_SIZE,
-            ]
-            local_known = known[region]
-            fraction = float(local_known.mean())
-
-            if fraction < MIN_KNOWN_FRACTION or not local_known.any():
-                skipped += 1
-                continue
-
-            local_holes = holes[region]
-            visible = observed[region][local_known]
-
-            offset = float(visible.min())
-            scale = max(
-                float(visible.max()) - offset,
-                minimum_scale,
+            block = np.asarray(
+                array[rows, cols],
+                dtype=(
+                    np.uint32
+                    if integer
+                    else np.float64
+                ),
             )
 
-            base = np.zeros(
-                (PATCH_SIZE, PATCH_SIZE),
-                dtype=np.float32,
+            dst.write(
+                block,
+                1,
+                window=window,
             )
-            base[local_known] = (
-                (visible - offset) / scale
-            ).astype(np.float32)
 
-            active = local_known.copy()
+        if name is not None:
+            dst.set_band_description(1, name)
 
-            if NOISE_CONTEXT_BAND > 0:
-                nearby = box_sum(
-                    local_holes.astype(np.float64),
-                    2 * NOISE_CONTEXT_BAND + 1,
-                    mode="constant",
-                ) > 0.5
-                active &= nearby
-
-            # [вариант, канал, строка, столбец].
-            conditions = np.empty(
-                (ENSEMBLE_RUNS, 2, PATCH_SIZE, PATCH_SIZE),
-                dtype=np.float32,
+        if description is not None:
+            dst.update_tags(
+                1,
+                description=description,
             )
-            conditions[:, 1] = local_known.astype(np.float32)
 
-            for run_index in range(ENSEMBLE_RUNS):
-                noise = make_noise(
-                    run_index, row, col, active
-                )
-                conditions[run_index, 0] = base + noise / scale
 
-            if not np.isfinite(conditions).all():
-                raise RuntimeError("NaN/Inf при подготовке входа.")
-
-            inputs.append(conditions)
-            metadata.append((
-                row,
-                col,
-                offset,
-                scale,
-                fraction ** CONTEXT_WEIGHT_POWER,
-            ))
-
-        return (
-            np.concatenate(inputs, axis=0) if inputs else None,
-            metadata,
-            skipped,
-            len(coordinates),
-        )
-
-    storage_bytes = ENSEMBLE_RUNS * count * 8
-    print(
-        f"Компактный накопитель: {storage_bytes / 1024**2:.1f} MiB "
-        f"({'disk' if USE_DISK_ACCUMULATOR else 'RAM'})"
+def save_dem_layers(
+    original,
+    observed,
+    completed,
+    filled,
+    metadata,
+):
+    expected_shape = (
+        metadata["height"],
+        metadata["width"],
     )
 
-    temporary_parent = (
-        str(TEMP_DIRECTORY)
-        if TEMP_DIRECTORY is not None else None
+    for name, array in (
+        ("original", original),
+        ("observed", observed),
+        ("completed", completed),
+        ("filled", filled),
+    ):
+        if array.shape != expected_shape:
+            raise ValueError(
+                f"Неверный размер {name}: {array.shape}."
+            )
+
+    if not np.isfinite(original[filled]).all():
+        raise ValueError(
+            "Для восстановленных пикселей отсутствует "
+            "базовая высота."
+        )
+
+    if not np.isfinite(completed[filled]).all():
+        raise ValueError(
+            "В восстановленных пикселях есть NaN/Inf."
+        )
+
+    restored_only = np.full(
+        expected_shape,
+        np.nan,
+        dtype=np.float64,
     )
 
-    started = time.perf_counter()
-    processed = skipped_total = candidates = 0
-    model_calls = 0
+    restored_only[filled] = completed[filled]
 
-    with tempfile.TemporaryDirectory(
-        prefix="quarryvae_fast_",
-        dir=temporary_parent,
-    ) as temporary:
-        if USE_DISK_ACCUMULATOR:
-            accumulator = np.memmap(
-                Path(temporary) / "ensemble.dat",
-                mode="w+",
-                dtype=np.float64,
-                shape=(ENSEMBLE_RUNS, count),
-            )
-            accumulator[:] = 0
-        else:
-            accumulator = np.zeros(
-                (ENSEMBLE_RUNS, count),
-                dtype=np.float64,
-            )
+    error = np.full(
+        expected_shape,
+        np.nan,
+        dtype=np.float64,
+    )
 
-        try:
-            tasks = iter(coordinate_tasks())
+    error[filled] = (
+        completed[filled] - original[filled]
+    )
 
-            with ThreadPoolExecutor(
-                max_workers=PREPARATION_WORKERS,
-                thread_name_prefix="dem_prepare",
-            ) as executor:
-                pending = deque()
-
-                def submit_next():
-                    try:
-                        coordinates = next(tasks)
-                    except StopIteration:
-                        return False
-
-                    pending.append(
-                        executor.submit(prepare_task, coordinates)
-                    )
-                    return True
-
-                for _ in range(PREFETCH_TASKS):
-                    if not submit_next():
-                        break
-
-                while pending:
-                    inputs, metadata, skipped, candidate_count = (
-                        pending.popleft().result()
-                    )
-                    submit_next()
-
-                    skipped_total += skipped
-                    candidates += candidate_count
-
-                    if inputs is None:
-                        continue
-
-                    # Предсказания только небольшого текущего задания.
-                    predictions = np.empty(
-                        (len(inputs), PATCH_SIZE, PATCH_SIZE),
-                        dtype=np.float32,
-                    )
-
-                    for start in range(0, len(inputs), MODEL_BATCH_SIZE):
-                        end = min(start + MODEL_BATCH_SIZE, len(inputs))
-
-                        tensor = torch.from_numpy(
-                            inputs[start:end]
-                        ).to(device)
-
-                        output = model(
-                            tensor,
-                            stochastic=STOCHASTIC_LATENT,
-                        )
-
-                        predictions[start:end] = (
-                            output[:, 0].cpu().numpy()
-                        )
-                        model_calls += 1
-
-                    if not np.isfinite(predictions).all():
-                        raise RuntimeError("Модель вернула NaN/Inf.")
-
-                    predictions = predictions.reshape(
-                        len(metadata),
-                        ENSEMBLE_RUNS,
-                        PATCH_SIZE,
-                        PATCH_SIZE,
-                    )
-
-                    # Запись накопителей только из основного потока.
-                    for variants, info in zip(predictions, metadata):
-                        row, col, offset, scale, context_weight = info
-
-                        region = np.s_[
-                            row:row + PATCH_SIZE,
-                            col:col + PATCH_SIZE,
-                        ]
-                        local_holes = holes[region]
-                        ids = index_map[region][local_holes]
-
-                        weights = (
-                            blend[local_holes] * context_weight
-                        )
-
-                        physical = (
-                            variants[:, local_holes].astype(np.float64)
-                            * scale
-                            + offset
-                        )
-
-                        # ids внутри одного окна уникальны.
-                        accumulator[:, ids] += physical * weights[None]
-                        denominator[ids] += weights
-
-                    previous = processed
-                    processed += len(metadata)
-
-                    if (
-                        processed // PRINT_EVERY_WINDOWS
-                        > previous // PRINT_EVERY_WINDOWS
-                    ):
-                        elapsed = time.perf_counter() - started
-                        print(
-                            f"Окон: {processed:,} | "
-                            f"предсказаний: {processed * ENSEMBLE_RUNS:,} | "
-                            f"{elapsed:.1f} с"
-                        )
-
-            del index_map
-
-            # Преобразуем суммы в итоговые предсказания каждого прохода.
-            for start in range(0, count, AGGREGATION_CHUNK_PIXELS):
-                end = min(start + AGGREGATION_CHUNK_PIXELS, count)
-                weights = denominator[start:end]
-                usable = weights > 0
-
-                block = np.array(
-                    accumulator[:, start:end],
-                    copy=True,
-                )
-                block[:, usable] /= weights[usable][None]
-                block[:, ~usable] = np.nan
-                accumulator[:, start:end] = block
-
-            (
-                baseline,
-                completed,
-                spread,
-                accepted,
-                rejected,
-                aggregation,
-            ) = aggregate(
-                accumulator,
-                hole_indices,
-                observed,
-            )
-
-        finally:
-            if isinstance(accumulator, np.memmap):
-                accumulator.flush()
-                accumulator._mmap.close()
-            del accumulator
-
-    statistics = {
-        "candidate_windows": candidates,
-        "processed_windows": processed,
-        "skipped_windows": skipped_total,
-        "model_calls": model_calls,
-        "network_predictions": processed * ENSEMBLE_RUNS,
-        "inference_and_aggregation_seconds": float(
-            time.perf_counter() - started
-        ),
-        "preparation_workers": PREPARATION_WORKERS,
-        "model_batch_size": MODEL_BATCH_SIZE,
-        **aggregation,
-    }
-
-    return baseline, completed, spread, accepted, rejected, statistics
-
-
-def aggregate(samples, hole_indices, observed):
-    baseline = observed.copy()
-    completed = observed.copy()
-
-    spread = np.full(observed.shape, np.nan, dtype=np.float64)
-    accepted_map = np.zeros(observed.shape, dtype=np.uint32)
-    rejected_map = np.zeros(observed.shape, dtype=np.uint32)
-
-    base_flat = baseline.ravel()
-    result_flat = completed.ravel()
-    spread_flat = spread.ravel()
-    accepted_flat = accepted_map.ravel()
-    rejected_flat = rejected_map.ravel()
-
-    total_rejected = total_available = fallback_pixels = 0
-
-    for start in range(0, len(hole_indices), AGGREGATION_CHUNK_PIXELS):
-        end = min(start + AGGREGATION_CHUNK_PIXELS, len(hole_indices))
-
-        values = np.array(samples[:, start:end], copy=True)
-        usable = np.isfinite(values).any(axis=0)
-
-        if not usable.any():
-            continue
-
-        destination = hole_indices[start:end][usable]
-        values = values[:, usable]
-
-        available = np.isfinite(values)
-        available_count = available.sum(axis=0)
-
-        median = np.nanmedian(values, axis=0)
-        deviation = np.abs(values - median[None])
-        mad = np.nanmedian(deviation, axis=0)
-
-        threshold = np.maximum(
-            MAD_THRESHOLD * 1.4826 * mad,
-            MIN_REJECTION_THRESHOLD_M,
-        )
-
-        accepted = available & (deviation <= threshold[None])
-        accepted_count = accepted.sum(axis=0)
-
-        mean = np.where(accepted, values, 0).sum(axis=0)
-        mean /= np.maximum(accepted_count, 1)
-
-        fallback = accepted_count < MIN_ACCEPTED_PREDICTIONS
-        estimate = np.where(fallback, median, mean)
-
-        all_mean = (
-            np.where(available, values, 0).sum(axis=0)
-            / available_count
-        )
-        residual = np.where(
-            available,
-            values - all_mean[None],
-            0,
-        )
-        std = np.sqrt(
-            (residual ** 2).sum(axis=0) / available_count
-        )
-
-        base_flat[destination] = values[0]
-        result_flat[destination] = estimate
-        spread_flat[destination] = std
-
-        accepted_flat[destination] = accepted_count
-        rejected_flat[destination] = available_count - accepted_count
-
-        total_rejected += int((available_count - accepted_count).sum())
-        total_available += int(available_count.sum())
-        fallback_pixels += int(fallback.sum())
-
-    return (
-        baseline,
-        completed,
-        spread,
-        accepted_map,
-        rejected_map,
+    layers = [
         {
-            "rejected_predictions": total_rejected,
-            "available_predictions": total_available,
-            "rejected_fraction": (
-                total_rejected / total_available
-                if total_available else 0.0
+            "filename": "dem_filled.tif",
+            "name": "completed_surface",
+            "description": (
+                "Observed elevations plus reconstructed elevations; "
+                "unresolved gaps remain NoData"
             ),
-            "median_fallback_pixels": fallback_pixels,
+            "array": completed,
+        },
+        {
+            "filename": "dem_with_defects.tif",
+            "name": "surface_with_gaps",
+            "description": (
+                "Surface after artificial gaps were introduced"
+            ),
+            "array": observed,
+        },
+        {
+            "filename": "dem_restored_only.tif",
+            "name": "restored_elevations_only",
+            "description": (
+                "Reconstructed elevations at successfully filled "
+                "pixels only; all other pixels are NoData"
+            ),
+            "array": restored_only,
+        },
+        {
+            "filename": "reconstruction_error.tif",
+            "name": "reconstruction_error",
+            "description": (
+                "Reconstructed minus original elevation "
+                "at successfully filled pixels only"
+            ),
+            "array": error,
+        },
+        {
+            "filename": "dem_original.tif",
+            "name": "original_surface",
+            "description": (
+                "Original surface before artificial gaps"
+            ),
+            "array": original,
+        },
+    ]
+
+    print("\nСохранение пяти слоёв DEM")
+
+    for layer in layers:
+        write_geotiff(
+            OUTPUT_DIR / layer["filename"],
+            layer["array"],
+            metadata,
+            name=layer["name"],
+            description=layer["description"],
+        )
+
+        print(f"  {layer['filename']}")
+
+    if SAVE_MULTIBAND_GEOTIFF:
+        comparison_path = (
+            OUTPUT_DIR / "dem_comparison.tif"
+        )
+
+        profile = geotiff_profile(
+            metadata,
+            count=len(layers),
+        )
+
+        with rasterio.open(
+            comparison_path,
+            "w",
+            **profile,
+        ) as dst:
+            for band_index, layer in enumerate(
+                layers,
+                start=1,
+            ):
+                dst.set_band_description(
+                    band_index,
+                    layer["name"],
+                )
+
+                dst.update_tags(
+                    band_index,
+                    description=layer["description"],
+                )
+
+            # Запись блоками без np.stack пяти полных DEM.
+            for _, window in dst.block_windows(1):
+                rows, cols = window.toslices()
+
+                for band_index, layer in enumerate(
+                    layers,
+                    start=1,
+                ):
+                    block = np.asarray(
+                        layer["array"][rows, cols],
+                        dtype=np.float64,
+                    )
+
+                    dst.write(
+                        block,
+                        band_index,
+                        window=window,
+                    )
+
+        print(f"  {comparison_path.name}")
+
+    write_json(
+        OUTPUT_DIR / "dem_layers.json",
+        {
+            "multiband_file": (
+                "dem_comparison.tif"
+                if SAVE_MULTIBAND_GEOTIFF
+                else None
+            ),
+            "nodata": "NaN",
+            "error_definition": (
+                "reconstructed elevation minus original elevation"
+            ),
+            "layers": [
+                {
+                    "band": band_index,
+                    "name": layer["name"],
+                    "file": layer["filename"],
+                    "description": layer["description"],
+                }
+                for band_index, layer in enumerate(
+                    layers,
+                    start=1,
+                )
+            ],
         },
     )
+
+    return error
 
 
 def error_metrics(values):
@@ -1026,141 +1061,257 @@ def error_metrics(values):
         }
 
     return {
-        "rmse_m": float(np.sqrt(np.mean(values ** 2))),
-        "mae_m": float(np.mean(np.abs(values))),
-        "bias_m": float(np.mean(values)),
-        "max_absolute_error_m": float(np.max(np.abs(values))),
+        "rmse_m": float(
+            np.sqrt(np.mean(values ** 2))
+        ),
+        "mae_m": float(
+            np.mean(np.abs(values))
+        ),
+        "bias_m": float(
+            np.mean(values)
+        ),
+        "max_absolute_error_m": float(
+            np.max(np.abs(values))
+        ),
     }
 
 
-def build_reports(original, baseline, completed, labels, records):
+def build_reports(
+    original,
+    completed,
+    labels,
+    filled,
+    records,
+):
     per_defect = []
-    groups = {}
 
     for record in records:
-        row, col = record["row"], record["col"]
+        row = record["row"]
+        col = record["col"]
+
         region = np.s_[
             row:row + record["bbox_height"],
             col:col + record["bbox_width"],
         ]
 
-        defect = labels[region] == record["id"]
-        valid_result = defect & np.isfinite(completed[region])
-        valid_baseline = defect & np.isfinite(baseline[region])
-
-        errors = (
-            completed[region][valid_result]
-            - original[region][valid_result]
+        local_defect = (
+            labels[region] == record["id"]
         )
-        baseline_errors = (
-            baseline[region][valid_baseline]
-            - original[region][valid_baseline]
+
+        local_filled = (
+            local_defect & filled[region]
+        )
+
+        values = (
+            completed[region][local_filled]
+            - original[region][local_filled]
         )
 
         per_defect.append({
             **record,
-            "filled_pixels": int(valid_result.sum()),
-            "coverage": float(valid_result.sum() / record["pixels"]),
-            "baseline_rmse_m": error_metrics(baseline_errors)["rmse_m"],
-            **error_metrics(errors),
+            "filled_pixels": int(
+                local_filled.sum()
+            ),
+            "unfilled_pixels": int(
+                local_defect.sum()
+                - local_filled.sum()
+            ),
+            "coverage": float(
+                local_filled.sum() / record["pixels"]
+            ),
+            **error_metrics(values),
         })
-
-        key = (record["type"], record["size_group"])
-        group = groups.setdefault(key, {
-            "errors": [],
-            "baseline_errors": [],
-            "defects": 0,
-            "pixels": 0,
-            "filled_pixels": 0,
-        })
-
-        group["errors"].append(errors)
-        group["baseline_errors"].append(baseline_errors)
-        group["defects"] += 1
-        group["pixels"] += record["pixels"]
-        group["filled_pixels"] += int(valid_result.sum())
 
     grouped = []
 
-    for (kind, size), group in sorted(groups.items()):
-        errors = np.concatenate(group["errors"])
-        baseline_errors = np.concatenate(group["baseline_errors"])
+    for kind in DEFECT_TYPES:
+        for group in SIZE_GROUPS:
+            selected = [
+                record
+                for record in records
+                if (
+                    record["type"] == kind
+                    and record["size_group"] == group
+                )
+            ]
 
-        grouped.append({
-            "type": kind,
-            "size_group": size,
-            "defects": group["defects"],
-            "pixels": group["pixels"],
-            "filled_pixels": group["filled_pixels"],
-            "coverage": group["filled_pixels"] / group["pixels"],
-            "baseline_rmse_m": error_metrics(baseline_errors)["rmse_m"],
-            **error_metrics(errors),
-        })
+            if not selected:
+                continue
+
+            errors = []
+            total_pixels = 0
+            filled_pixels = 0
+
+            for record in selected:
+                row = record["row"]
+                col = record["col"]
+
+                region = np.s_[
+                    row:row + record["bbox_height"],
+                    col:col + record["bbox_width"],
+                ]
+
+                local = (
+                    (labels[region] == record["id"])
+                    & filled[region]
+                )
+
+                errors.append(
+                    completed[region][local]
+                    - original[region][local]
+                )
+
+                total_pixels += record["pixels"]
+                filled_pixels += int(local.sum())
+
+            values = np.concatenate(errors)
+
+            grouped.append({
+                "type": kind,
+                "size_group": group,
+                "defects": len(selected),
+                "pixels": total_pixels,
+                "filled_pixels": filled_pixels,
+                "unfilled_pixels": (
+                    total_pixels - filled_pixels
+                ),
+                "coverage": (
+                    filled_pixels / total_pixels
+                ),
+                **error_metrics(values),
+            })
 
     return per_defect, grouped
 
 
-def save_figures(original, observed, baseline, completed, records):
+def save_figures(
+    original,
+    observed,
+    completed,
+    error,
+    records,
+):
     step = max(
         1,
-        int(np.ceil(max(original.shape) / OVERVIEW_MAX_SIDE)),
+        int(
+            np.ceil(
+                max(original.shape) / OVERVIEW_MAX_SIDE
+            )
+        ),
     )
 
-    sampled = original[::step, ::step]
-    finite = sampled[np.isfinite(sampled)]
+    arrays = [
+        original[::step, ::step],
+        observed[::step, ::step],
+        completed[::step, ::step],
+    ]
 
-    if not finite.size:
-        finite = original[np.isfinite(original)]
+    finite_original = arrays[0][
+        np.isfinite(arrays[0])
+    ]
 
-    low = float(finite.min())
-    high = max(float(finite.max()), low + 1e-6)
+    if not finite_original.size:
+        finite_original = original[
+            np.isfinite(original)
+        ]
 
-    fig, axes = plt.subplots(1, 4, figsize=(21, 6))
+    low = float(finite_original.min())
+    high = max(
+        float(finite_original.max()),
+        low + 1e-6,
+    )
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(18, 6),
+    )
 
     for axis, array, title in zip(
         axes,
-        [original, observed, baseline, completed],
-        ["Original", "With defects", "Baseline", "Robust ensemble"],
+        arrays,
+        [
+            "Original DEM",
+            "With defects",
+            "Completed DEM",
+        ],
     ):
         image = axis.imshow(
-            array[::step, ::step],
+            array,
             cmap="terrain",
             vmin=low,
             vmax=high,
         )
+
         axis.set_title(title)
         axis.axis("off")
-        fig.colorbar(image, ax=axis, shrink=0.7)
+
+        fig.colorbar(
+            image,
+            ax=axis,
+            shrink=0.7,
+        )
 
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "overview.png", dpi=160)
+    fig.savefig(
+        OUTPUT_DIR / "overview.png",
+        dpi=180,
+    )
     plt.close(fig)
 
     candidates = []
 
     for kind in DEFECT_TYPES:
-        for size in SIZE_GROUPS:
+        for group in SIZE_GROUPS:
             matches = [
-                r for r in records
-                if r["type"] == kind and r["size_group"] == size
+                record
+                for record in records
+                if (
+                    record["type"] == kind
+                    and record["size_group"] == group
+                )
             ]
+
             if matches:
                 candidates.append(matches[0])
 
-    count = min(DETAIL_EXAMPLES, len(candidates))
-    indices = np.linspace(0, len(candidates) - 1, count, dtype=int)
+    if not candidates:
+        return
+
+    count = min(
+        DETAIL_EXAMPLES,
+        len(candidates),
+    )
+
+    chosen_indices = np.linspace(
+        0,
+        len(candidates) - 1,
+        count,
+        dtype=int,
+    )
+
+    examples = [
+        candidates[index]
+        for index in chosen_indices
+    ]
 
     fig, axes = plt.subplots(
-        count, 5,
-        figsize=(21, 3.2 * count),
+        count,
+        4,
+        figsize=(17, 3.2 * count),
         squeeze=False,
     )
 
-    for line, index in enumerate(indices):
-        record = candidates[index]
+    for row_index, record in enumerate(examples):
+        r0 = max(
+            0,
+            record["row"] - 12,
+        )
+        c0 = max(
+            0,
+            record["col"] - 12,
+        )
 
-        r0 = max(0, record["row"] - 12)
-        c0 = max(0, record["col"] - 12)
         r1 = min(
             original.shape[0],
             record["row"] + record["bbox_height"] + 12,
@@ -1169,66 +1320,145 @@ def save_figures(original, observed, baseline, completed, records):
             original.shape[1],
             record["col"] + record["bbox_width"] + 12,
         )
+
         region = np.s_[r0:r1, c0:c1]
 
         source = original[region]
         result = completed[region]
+        local_error = error[region]
 
-        lo = float(np.nanmin(source))
-        hi = float(np.nanmax(source))
+        finite_source = source[
+            np.isfinite(source)
+        ]
+        finite_result = result[
+            np.isfinite(result)
+        ]
 
-        finite_result = result[np.isfinite(result)]
+        lo = float(finite_source.min())
+        hi = float(finite_source.max())
+
         if finite_result.size:
-            lo = min(lo, float(finite_result.min()))
-            hi = max(hi, float(finite_result.max()))
-        hi = max(hi, lo + 1e-6)
+            lo = min(
+                lo,
+                float(finite_result.min()),
+            )
+            hi = max(
+                hi,
+                float(finite_result.max()),
+            )
 
-        error = np.where(
-            np.isnan(observed[region]) & np.isfinite(source),
-            result - source,
-            np.nan,
+        hi = max(
+            hi,
+            lo + 1e-6,
         )
-        finite_error = error[np.isfinite(error)]
-        limit = (
-            max(float(np.abs(finite_error).max()), 0.01)
-            if finite_error.size else 0.01
+
+        finite_error = local_error[
+            np.isfinite(local_error)
+        ]
+
+        error_limit = (
+            max(
+                float(np.abs(finite_error).max()),
+                0.01,
+            )
+            if finite_error.size
+            else 0.01
         )
 
         images = [
             source,
             observed[region],
-            baseline[region],
             result,
-            error,
+            local_error,
         ]
-        titles = ["Original", "Defect", "Baseline", "Ensemble", "Error, m"]
 
-        for column, (array, title) in enumerate(zip(images, titles)):
-            axis = axes[line, column]
-            is_error = column == 4
+        titles = [
+            "Original",
+            "Defect",
+            "Completed",
+            "Error, m",
+        ]
+
+        for col_index, (array, title) in enumerate(
+            zip(images, titles)
+        ):
+            axis = axes[row_index, col_index]
+            is_error = col_index == 3
 
             image = axis.imshow(
                 array,
-                cmap="RdBu_r" if is_error else "terrain",
-                vmin=-limit if is_error else lo,
-                vmax=limit if is_error else hi,
+                cmap=(
+                    "RdBu_r"
+                    if is_error
+                    else "terrain"
+                ),
+                vmin=(
+                    -error_limit
+                    if is_error
+                    else lo
+                ),
+                vmax=(
+                    error_limit
+                    if is_error
+                    else hi
+                ),
             )
+
             axis.set_title(
                 f"{record['type']}/{record['size_group']} | {title}",
-                fontsize=8,
+                fontsize=9,
             )
             axis.axis("off")
-            fig.colorbar(image, ax=axis, shrink=0.7)
+
+            fig.colorbar(
+                image,
+                ax=axis,
+                shrink=0.7,
+            )
 
     fig.tight_layout()
-    fig.savefig(OUTPUT_DIR / "defect_examples.png", dpi=140)
+    fig.savefig(
+        OUTPUT_DIR / "defect_examples.png",
+        dpi=150,
+    )
     plt.close(fig)
+
+
+def save_run_config(device):
+    config = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in globals().items()
+        if (
+            key.isupper()
+            and isinstance(
+                value,
+                (
+                    str,
+                    int,
+                    float,
+                    bool,
+                    tuple,
+                    dict,
+                    Path,
+                    type(None),
+                ),
+            )
+        )
+    }
+
+    config["selected_device"] = str(device)
+    config["torch_version"] = str(torch.__version__)
+    config["numpy_version"] = str(np.__version__)
+
+    write_json(
+        OUTPUT_DIR / "config.json",
+        config,
+    )
 
 
 def main():
     validate_settings()
 
-    torch.set_num_threads(TORCH_CPU_THREADS)
     torch.manual_seed(SEED)
 
     if torch.cuda.is_available():
@@ -1242,107 +1472,124 @@ def main():
     model, checkpoint = load_model(device)
 
     original, valid, metadata = load_dem()
+
+    print(f"Device: {device}")
+    print(f"DEM: {original.shape}")
+    print(f"Resolution: {metadata['resolution']}")
+    print(f"Checkpoint epoch: {checkpoint['epoch']}")
+
+    if metadata["crs"] is None:
+        print(
+            "CRS отсутствует: результаты сохраняются "
+            "без назначения системы координат."
+        )
+
     labels, records, failed = create_defects(valid)
 
     holes = labels > 0
-    known = valid & ~holes
 
     observed = original.copy()
     observed[holes] = np.nan
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=False)
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
 
-    config = {
-        key: str(value) if isinstance(value, Path) else value
-        for key, value in globals().items()
-        if key.isupper()
-        and isinstance(
-            value,
-            (str, int, float, bool, tuple, dict, Path, type(None)),
-        )
-    }
-    config["selected_device"] = str(device)
-    config["torch_version"] = str(torch.__version__)
+    save_run_config(device)
 
-    write_json(OUTPUT_DIR / "config.json", config)
-    write_csv(OUTPUT_DIR / "defect_geometry.csv", records)
+    write_csv(
+        OUTPUT_DIR / "defect_geometry.csv",
+        records,
+    )
 
+    # Сохраняем повреждённую DEM до начала инференса.
     write_geotiff(
         OUTPUT_DIR / "dem_with_defects.tif",
         observed,
         metadata,
-    )
-    write_geotiff(
-        OUTPUT_DIR / "defect_ids.tif",
-        labels,
-        metadata,
-        integer=True,
+        name="surface_with_gaps",
     )
 
-    print(f"Device: {device}")
-    print(f"DEM: {original.shape}")
-    print(f"Threads: {PREPARATION_WORKERS}")
-    print(f"Model batch: {MODEL_BATCH_SIZE}")
-    print(f"Ensemble: {ENSEMBLE_RUNS}, noise std={NOISE_STD_M} m")
+    if SAVE_DIAGNOSTIC_MASKS:
+        write_geotiff(
+            OUTPUT_DIR / "defect_ids.tif",
+            labels,
+            metadata,
+            integer=True,
+            name="artificial_defect_id",
+            description="0=background; positive value=defect ID",
+        )
 
-    (
-        baseline,
-        completed,
-        spread,
-        accepted,
-        rejected,
-        statistics,
-    ) = run_ensemble(
-        model,
-        observed,
-        known,
-        holes,
-        checkpoint["preprocessing"],
-        device,
+    completed, filled, statistics = reconstruct(
+        model=model,
+        observed=observed,
+        valid=valid,
+        labels=labels,
+        preprocessing=checkpoint["preprocessing"],
+        device=device,
     )
 
-    filled = holes & np.isfinite(completed)
-    baseline_filled = holes & np.isfinite(baseline)
+    unchanged = valid & ~holes
 
-    if not np.array_equal(completed[known], original[known]):
-        raise RuntimeError("Известные высоты изменились.")
+    if not np.array_equal(
+        completed[unchanged],
+        original[unchanged],
+    ):
+        raise RuntimeError(
+            "Известные высоты изменились."
+        )
 
     if np.isfinite(completed[~valid]).any():
-        raise RuntimeError("Исходные NoData заполнены.")
+        raise RuntimeError(
+            "Исходные NoData неожиданно заполнены."
+        )
 
-    if not np.array_equal(filled, baseline_filled):
-        raise RuntimeError("Покрытие baseline и ансамбля различается.")
+    # Пять основных слоёв и общий пятиканальный GeoTIFF.
+    error = save_dem_layers(
+        original=original,
+        observed=observed,
+        completed=completed,
+        filled=filled,
+        metadata=metadata,
+    )
 
-    error = np.full(original.shape, np.nan, dtype=np.float64)
-    error[filled] = completed[filled] - original[filled]
-
-    outputs = [
-        ("dem_baseline.tif", baseline, False),
-        ("dem_filled.tif", completed, False),
-        ("reconstruction_error.tif", error, False),
-        ("ensemble_spread_m.tif", spread, False),
-        ("accepted_predictions.tif", accepted, True),
-        ("rejected_predictions.tif", rejected, True),
-        ("filled_pixels.tif", filled, True),
-        ("unfilled_pixels.tif", holes & ~filled, True),
-    ]
-
-    for filename, array, integer in outputs:
+    if SAVE_DIAGNOSTIC_MASKS:
         write_geotiff(
-            OUTPUT_DIR / filename,
-            array,
+            OUTPUT_DIR / "filled_pixels.tif",
+            filled,
             metadata,
-            integer=integer,
+            integer=True,
+            name="filled_pixels",
+            description="1=successfully reconstructed artificial gap",
+        )
+
+        write_geotiff(
+            OUTPUT_DIR / "unfilled_pixels.tif",
+            holes & ~filled,
+            metadata,
+            integer=True,
+            name="unfilled_pixels",
+            description="1=artificial gap left unfilled",
         )
 
     per_defect, grouped = build_reports(
-        original, baseline, completed, labels, records
+        original=original,
+        completed=completed,
+        labels=labels,
+        filled=filled,
+        records=records,
     )
 
-    write_csv(OUTPUT_DIR / "defects.csv", per_defect)
-    write_csv(OUTPUT_DIR / "metrics_by_type_and_size.csv", grouped)
+    write_csv(
+        OUTPUT_DIR / "defects.csv",
+        per_defect,
+    )
 
-    baseline_error = baseline[filled] - original[filled]
+    write_csv(
+        OUTPUT_DIR / "metrics_by_type_and_size.csv",
+        grouped,
+    )
 
     report = {
         "source": str(SOURCE_DEM),
@@ -1350,46 +1597,92 @@ def main():
         "checkpoint_epoch": int(checkpoint["epoch"]),
         "device": str(device),
         "seed": SEED,
+        "stochastic": STOCHASTIC,
+        "shape": list(original.shape),
+        "resolution": metadata["resolution"],
+        "patch_size": PATCH_SIZE,
         "stride": STRIDE,
-        "ensemble_runs": ENSEMBLE_RUNS,
-        "noise_std_m": NOISE_STD_M,
+        "min_known_fraction": MIN_KNOWN_FRACTION,
         "created_defects": len(records),
         "unplaced_defects": failed,
         "hidden_pixels": int(holes.sum()),
         "filled_pixels": int(filled.sum()),
-        "coverage": float(filled.sum() / holes.sum()),
-        "baseline": error_metrics(baseline_error),
-        "ensemble": error_metrics(error[filled]),
-        "known_pixels_unchanged": True,
-        "predictions_reused_as_context": False,
-        "rejection_level": "between complete sliding-window variants",
-        "spread_interpretation": (
-            "Sensitivity to perturbations, not calibrated DEM accuracy"
+        "unfilled_pixels": int(
+            (holes & ~filled).sum()
         ),
+        "coverage": float(
+            filled.sum() / holes.sum()
+        ),
+        "known_pixels_unchanged": True,
+        "original_nodata_preserved": True,
+        "predictions_reused_as_context": False,
+        "metrics_region": (
+            "successfully reconstructed artificial holes"
+        ),
+        "error_definition": (
+            "reconstructed elevation minus original elevation"
+        ),
+        "source_scale": metadata["source_scale"],
+        "source_offset": metadata["source_offset"],
         "crs": (
             metadata["crs"].to_string()
-            if metadata["crs"] is not None else None
+            if metadata["crs"] is not None
+            else None
+        ),
+        "main_layers": [
+            "dem_filled.tif",
+            "dem_with_defects.tif",
+            "dem_restored_only.tif",
+            "reconstruction_error.tif",
+            "dem_original.tif",
+        ],
+        "multiband_file": (
+            "dem_comparison.tif"
+            if SAVE_MULTIBAND_GEOTIFF
+            else None
         ),
         **statistics,
+        **error_metrics(error[filled]),
     }
 
-    write_json(OUTPUT_DIR / "report.json", report)
+    write_json(
+        OUTPUT_DIR / "report.json",
+        report,
+    )
 
     save_figures(
-        original, observed, baseline, completed, records
+        original=original,
+        observed=observed,
+        completed=completed,
+        error=error,
+        records=records,
     )
 
     print("\nГотово.")
-    print(f"Покрытие: {100 * report['coverage']:.2f}%")
-
-    if report["baseline"]["rmse_m"] is not None:
-        print(f"Baseline RMSE: {report['baseline']['rmse_m']:.3f} м")
-        print(f"Ensemble RMSE: {report['ensemble']['rmse_m']:.3f} м")
-
     print(
-        f"Время инференса и объединения: "
-        f"{statistics['inference_and_aggregation_seconds']:.1f} с"
+        f"Скрыто пикселей: "
+        f"{report['hidden_pixels']:,}"
     )
+    print(
+        f"Восстановлено: "
+        f"{report['filled_pixels']:,}"
+    )
+    print(
+        f"Покрытие: "
+        f"{100 * report['coverage']:.2f}%"
+    )
+
+    if report["rmse_m"] is not None:
+        print(f"RMSE: {report['rmse_m']:.3f} м")
+        print(f"MAE: {report['mae_m']:.3f} м")
+        print(f"Bias: {report['bias_m']:.3f} м")
+
+    if report["unfilled_pixels"]:
+        print(
+            "Внимание: часть пропусков осталась незаполненной. "
+            "Метрики рассчитаны только по восстановленным пикселям."
+        )
+
     print(f"Результаты: {OUTPUT_DIR}")
 
 
