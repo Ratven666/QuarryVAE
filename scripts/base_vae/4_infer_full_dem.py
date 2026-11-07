@@ -19,7 +19,7 @@ from train_vae import QuarryCVAE
 
 # ============================= CONFIG =============================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 SOURCE_DEM = PROJECT_ROOT / "data/raw/1m/grib_1m.tif"
 

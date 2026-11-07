@@ -26,7 +26,7 @@ from train_vae import QuarryCVAE
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-SOURCE_DEM = PROJECT_ROOT / "data/derived/dem_sever_quarry.tif"
+SOURCE_DEM = PROJECT_ROOT / "data/derived/dem_real_photo_quarry_01.tif"
 
 CHECKPOINT_PATH = (
     PROJECT_ROOT

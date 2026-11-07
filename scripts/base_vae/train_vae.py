@@ -21,16 +21,16 @@ from torch.utils.data import DataLoader, Dataset
 
 # ============================= CONFIG =============================
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-DATA_DIR = PROJECT_ROOT / "data/processed/patches_64_d4"
+DATA_DIR = PROJECT_ROOT / "data/processed/patches_64_multi_d4"
 
 RUN_NAME = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 OUTPUT_DIR = PROJECT_ROOT / "outputs" / f"cvae_{RUN_NAME}"
 
 PATCH_SIZE = 64
-BATCH_SIZE = 32
-EPOCHS = 150
+BATCH_SIZE = 64
+EPOCHS = 300
 
 LEARNING_RATE = 2e-4
 WEIGHT_DECAY = 1e-5

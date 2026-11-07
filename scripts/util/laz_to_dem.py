@@ -30,13 +30,13 @@ def find_project_root() -> Path:
 
 PROJECT_ROOT = find_project_root()
 
-INPUT_LAZ = PROJECT_ROOT / "data/raw/sever_quarry_filtered.las"
+INPUT_LAZ = PROJECT_ROOT / "data/raw/real_photo_quarry.las"
 
-OUTPUT_DEM = PROJECT_ROOT / "data/derived/dem_sever_quarry.tif"
+OUTPUT_DEM = PROJECT_ROOT / "data/derived/dem_real_photo_quarry_01.tif"
 
 # Размер квадратной ячейки в единицах исходных XY.
 # При метрических координатах 1.0 означает 1 метр.
-RESOLUTION = 1.0
+RESOLUTION = 0.1
 
 # None — читать CRS из LAS/LAZ.
 # Если CRS в файле отсутствует, результат сохранится без CRS.
