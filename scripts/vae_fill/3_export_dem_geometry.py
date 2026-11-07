@@ -18,7 +18,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 INPUT_DEM = (
     PROJECT_ROOT
     / "outputs"
-    / "real_dem_fill_20261107_192540_788012"
+    / "real_dem_contour_fill_20261107_194157_455082"
     / "dem_restored_only.tif"
 )
 
