@@ -38,7 +38,7 @@ SOURCE_DEM = PROJECT_ROOT / "outputs/real_dem_contour_fill_20261107_200511_61675
 CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
-    / "cvae_20261107_201632_371010"
+    / "cvae_base"
     / "best_model.pt"
 )
 

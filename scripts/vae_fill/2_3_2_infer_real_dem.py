@@ -31,7 +31,7 @@ SOURCE_DEM = PROJECT_ROOT / "data/derived/dem_real_photo_quarry_01.tif"
 CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "outputs"
-    / "cvae_inpaint_20261107_155343_972452"
+    / "cvae_inpaint"
     / "best_model.pt"
 )
 
